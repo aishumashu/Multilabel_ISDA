@@ -22,6 +22,7 @@ import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset, Dataset
 from PIL import Image
+from torchmetrics.classification import MultilabelAveragePrecision
 
 
 class YOLOMultiLabelDataset(Dataset):
@@ -420,10 +421,13 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
     batch_time = AverageMeter("Time", use_accel, ":6.3f", Summary.NONE)
     data_time = AverageMeter("Data", use_accel, ":6.3f", Summary.NONE)
     losses = AverageMeter("Loss", use_accel, ":.4e", Summary.NONE)
-    top1 = AverageMeter("Acc@1", use_accel, ":6.2f", Summary.NONE)
-    top5 = AverageMeter("Acc@5", use_accel, ":6.2f", Summary.NONE)
+    mAP = AverageMeter("mAP", use_accel, ":6.2f", Summary.NONE)
+    f1_overall = AverageMeter("F1-Overall", use_accel, ":6.2f", Summary.NONE)
+    f1_classwise = AverageMeter("F1-Classwise", use_accel, ":6.2f", Summary.NONE)
     progress = ProgressMeter(
-        len(train_loader), [batch_time, data_time, losses, top1, top5], prefix="Epoch: [{}]".format(epoch)
+        len(train_loader),
+        [batch_time, data_time, losses, mAP, f1_overall, f1_classwise],
+        prefix="Epoch: [{}]".format(epoch),
     )
 
     # switch to train mode
@@ -436,17 +440,15 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
 
         # move data to the same device as model
         images = images.to(device, non_blocking=True)
-        target = target.to(device, non_blocking=True)
-
-        # compute output
+        target = target.to(device, non_blocking=True)  # compute output
         output = model(images)
         loss = criterion(output, target)
-
         # measure accuracy and record loss
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        acc1, acc2, acc3 = accuracy(output, target)
         losses.update(loss.item(), images.size(0))
-        top1.update(acc1[0], images.size(0))
-        top5.update(acc5[0], images.size(0))
+        mAP.update(acc1[0], images.size(0))
+        f1_overall.update(acc2[0], images.size(0))
+        f1_classwise.update(acc3[0], images.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -484,16 +486,16 @@ def validate(val_loader, model, criterion, args):
                     else:
                         images = images.to(device)
                         target = target.to(device)
-
                 # compute output
                 output = model(images)
                 loss = criterion(output, target)
 
                 # measure accuracy and record loss
-                acc1, acc5 = accuracy(output, target, topk=(1, 5))
+                acc1, acc2, acc3 = accuracy(output, target)
                 losses.update(loss.item(), images.size(0))
-                top1.update(acc1[0], images.size(0))
-                top5.update(acc5[0], images.size(0))
+                mAP.update(acc1[0], images.size(0))
+                f1_overall.update(acc2[0], images.size(0))
+                f1_classwise.update(acc3[0], images.size(0))
 
                 # measure elapsed time
                 batch_time.update(time.time() - end)
@@ -504,11 +506,12 @@ def validate(val_loader, model, criterion, args):
 
     batch_time = AverageMeter("Time", use_accel, ":6.3f", Summary.NONE)
     losses = AverageMeter("Loss", use_accel, ":.4e", Summary.NONE)
-    top1 = AverageMeter("Acc@1", use_accel, ":6.2f", Summary.AVERAGE)
-    top5 = AverageMeter("Acc@5", use_accel, ":6.2f", Summary.AVERAGE)
+    mAP = AverageMeter("mAP", use_accel, ":6.2f", Summary.AVERAGE)
+    f1_overall = AverageMeter("F1-Overall", use_accel, ":6.2f", Summary.AVERAGE)
+    f1_classwise = AverageMeter("F1-Classwise", use_accel, ":6.2f", Summary.AVERAGE)
     progress = ProgressMeter(
         len(val_loader) + (args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset))),
-        [batch_time, losses, top1, top5],
+        [batch_time, losses, mAP, f1_overall, f1_classwise],
         prefix="Test: ",
     )
 
@@ -517,8 +520,9 @@ def validate(val_loader, model, criterion, args):
 
     run_validate(val_loader)
     if args.distributed:
-        top1.all_reduce()
-        top5.all_reduce()
+        mAP.all_reduce()
+        f1_overall.all_reduce()
+        f1_classwise.all_reduce()
 
     if args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset)):
         aux_val_dataset = Subset(
@@ -531,7 +535,7 @@ def validate(val_loader, model, criterion, args):
 
     progress.display_summary()
 
-    return top1.avg
+    return mAP.avg
 
 
 def save_checkpoint(state, is_best, filename="checkpoint.pth.tar"):
@@ -621,26 +625,46 @@ class ProgressMeter(object):
         return "[" + fmt + "/" + fmt.format(num_batches) + "]"
 
 
-def accuracy(output, target, topk=(1,)):
-    """Computes the accuracy for multi-label classification"""
+def accuracy(output, target):
+    """Computes multi-label classification metrics: mAP, Overall F1, and Class-wise F1"""
     with torch.no_grad():
         batch_size = target.size(0)
+        num_classes = target.size(1)
 
-        # 对于多标签分类，使用sigmoid和阈值
-        predictions = torch.sigmoid(output) > 0.5
+        # 使用sigmoid激活函数
+        sigmoid_output = torch.sigmoid(output)
+        predictions = sigmoid_output > 0.5
 
-        # 计算每个样本的准确率（完全匹配）
-        exact_match = (predictions == target.bool()).all(dim=1).float()
-        exact_match_acc = exact_match.mean() * 100.0
+        # 转换为布尔型以便计算
+        target_bool = target.bool()
+        predictions_bool = predictions.bool()
 
-        # 计算Jaccard Index (IoU)
-        intersection = (predictions & target.bool()).float().sum(dim=1)
-        union = (predictions | target.bool()).float().sum(dim=1)
-        jaccard = intersection / (union + 1e-8)
-        jaccard_acc = jaccard.mean() * 100.0
+        # 计算mAP (平均精度)
+        metric = MultilabelAveragePrecision(num_labels=num_classes, average="macro", thresholds=None)
+        mAP = metric(output, target) * 100.0
 
-        # 为了兼容原有代码，返回两个值
-        return [exact_match_acc], [jaccard_acc]
+        # 计算Overall F1 (micro-average)
+        tp_overall = (predictions_bool & target_bool).sum().float()
+        fp_overall = (predictions_bool & ~target_bool).sum().float()
+        fn_overall = (~predictions_bool & target_bool).sum().float()
+
+        precision_overall = tp_overall / (tp_overall + fp_overall + 1e-8)
+        recall_overall = tp_overall / (tp_overall + fn_overall + 1e-8)
+        f1_overall = 2 * precision_overall * recall_overall / (precision_overall + recall_overall + 1e-8)
+        f1_overall = f1_overall * 100.0
+
+        # 计算Class-wise F1 (macro-average)
+        tp_classwise = (predictions_bool & target_bool).sum(dim=0).float()
+        fp_classwise = (predictions_bool & ~target_bool).sum(dim=0).float()
+        fn_classwise = (~predictions_bool & target_bool).sum(dim=0).float()
+        precision_classwise = tp_classwise / (tp_classwise + fp_classwise + 1e-8)
+        recall_classwise = tp_classwise / (tp_classwise + fn_classwise + 1e-8)
+        f1_classwise = (
+            2 * precision_classwise * recall_classwise / (precision_classwise + recall_classwise + 1e-8)
+        ).mean() * 100.0
+
+        # 返回三个值：mAP, Overall F1, Class-wise F1
+        return [mAP], [f1_overall], [f1_classwise]
 
 
 if __name__ == "__main__":
