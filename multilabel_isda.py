@@ -610,7 +610,7 @@ def accuracy(output, target):
 
         # 计算mAP (平均精度)
         metric = MultilabelAveragePrecision(num_labels=num_classes, average="macro", thresholds=None)
-        mAP = metric(output, target) * 100.0
+        mAP = metric(output, target.int()) * 100.0
 
         # 计算Overall F1 (micro-average)
         tp_overall = (predictions_bool & target_bool).sum().float()
