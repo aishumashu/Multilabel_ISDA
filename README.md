@@ -10,5 +10,5 @@ python multilabel.py -a resnet50 --dist-url 'tcp://127.0.0.1:51444' --dist-backe
 **weighted var**
 
 ```
-python main.py -a resnet50 --dist-url 'tcp://127.0.0.1:51444' --dist-backend 'nccl' --multiprocessing-distributed --world-size 1 --rank 0 /data1/lyurenqin/workspace/dataset/VOC_yolo
+python multilabel_isda.py -a resnet50 --dist-url 'tcp://127.0.0.1:51444' --dist-backend 'nccl' --multiprocessing-distributed --world-size 1 --rank 0 /data1/lyurenqin/workspace/dataset/VOC_yolo
 ```
