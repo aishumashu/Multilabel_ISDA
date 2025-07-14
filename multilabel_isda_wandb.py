@@ -5,9 +5,9 @@ import shutil
 import time
 import warnings
 from enum import Enum
-import glob
 
 import torch
+import wandb
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -21,58 +21,10 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset, Dataset
-from PIL import Image
 from torchmetrics.classification import MultilabelAveragePrecision
-
-
-class YOLOMultiLabelDataset(Dataset):
-    """YOLO格式的多标签数据集"""
-
-    def __init__(self, img_dir, label_dir, class_names_file, transform=None):
-        self.img_dir = img_dir
-        self.label_dir = label_dir
-        self.transform = transform
-
-        # 读取类别名称
-        with open(class_names_file, "r", encoding="utf-8") as f:
-            self.class_names = [line.strip() for line in f.readlines()]
-        self.num_classes = len(self.class_names)
-
-        # 获取所有图片文件
-        self.img_files = []
-        for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp"]:
-            self.img_files.extend(glob.glob(os.path.join(img_dir, ext)))
-            self.img_files.extend(glob.glob(os.path.join(img_dir, ext.upper())))
-
-        self.img_files = sorted(self.img_files)
-
-    def __len__(self):
-        return len(self.img_files)
-
-    def __getitem__(self, idx):
-        # 读取图片
-        img_path = self.img_files[idx]
-        image = Image.open(img_path).convert("RGB")
-
-        # 读取标签文件
-        label_path = os.path.join(self.label_dir, os.path.splitext(os.path.basename(img_path))[0] + ".txt")
-
-        # 创建多标签向量
-        labels = torch.zeros(self.num_classes)
-
-        if os.path.exists(label_path):
-            with open(label_path, "r") as f:
-                for line in f.readlines():
-                    parts = line.strip().split()
-                    if len(parts) >= 1:
-                        class_id = int(parts[0])
-                        if 0 <= class_id < self.num_classes:
-                            labels[class_id] = 1.0
-
-        if self.transform:
-            image = self.transform(image)
-
-        return image, labels
+from utils.yolo_dataloader import YOLOMultiLabelDataset
+from utils.feature import ModelWithFeatures
+from utils.BCE_ISDA import ISDA_BCELoss
 
 
 model_names = sorted(
@@ -139,8 +91,23 @@ parser.add_argument(
     "multi node data parallel training",
 )
 parser.add_argument("--dummy", action="store_true", help="use fake data to benchmark")
+parser.add_argument("--project-name", default="multilabel-isda", type=str, help="wandb project name")
+parser.add_argument("--run-name", default=None, type=str, help="wandb run name")
+parser.add_argument("--wandb-offline", action="store_true", help="run wandb in offline mode")
 
 best_acc1 = 0
+
+
+def compute_gradient_norm(model):
+    """计算模型参数的梯度范数"""
+    total_norm = 0.0
+    param_count = 0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+            param_count += 1
+    return (total_norm**0.5) if param_count > 0 else 0.0
 
 
 def main():
@@ -201,6 +168,26 @@ def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
     args.gpu = gpu
 
+    # Initialize wandb
+    if args.rank == 0 or not args.distributed:
+        wandb_mode = "offline" if args.wandb_offline else "online"
+        wandb.init(
+            project=args.project_name,
+            name=args.run_name,
+            config={
+                "architecture": args.arch,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "learning_rate": args.lr,
+                "momentum": args.momentum,
+                "weight_decay": args.weight_decay,
+                "pretrained": args.pretrained,
+                "distributed": args.distributed,
+                "gpu_count": ngpus_per_node if args.distributed else 1,
+            },
+            mode=wandb_mode,
+        )
+
     use_accel = not args.no_accel and torch.accelerator.is_available()
 
     if use_accel:
@@ -250,6 +237,20 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             model.classifier = nn.Linear(model.classifier.in_features, num_classes)
 
+    # 使用包装器来支持特征提取
+    model = ModelWithFeatures(model)
+
+    # 获取特征维度
+    if hasattr(model.model, "fc"):
+        feature_num = model.model.fc.in_features
+    elif hasattr(model.model, "classifier"):
+        if isinstance(model.model.classifier, nn.Sequential):
+            feature_num = model.model.classifier[-1].in_features
+        else:
+            feature_num = model.model.classifier.in_features
+    else:
+        feature_num = 2048  # 默认值，适用于大多数ResNet
+
     if not use_accel:
         print("using CPU, this will be slow")
     elif args.distributed:
@@ -281,7 +282,8 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         model.to(device)
     # define loss function (criterion), optimizer, and learning rate scheduler
-    criterion = nn.BCEWithLogitsLoss().to(device)  # 多标签分类使用BCE损失
+    criterion_bce = nn.BCEWithLogitsLoss().to(device)  # 多标签分类使用BCE损失
+    criterion_isda = ISDA_BCELoss(feature_num, num_classes).to(device)
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
@@ -306,6 +308,7 @@ def main_worker(gpu, ngpus_per_node, args):
             model.load_state_dict(checkpoint["state_dict"])
             optimizer.load_state_dict(checkpoint["optimizer"])
             scheduler.load_state_dict(checkpoint["scheduler"])
+            criterion_isda = checkpoint["criterion_isda"]
             print("=> loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint["epoch"]))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
@@ -313,19 +316,17 @@ def main_worker(gpu, ngpus_per_node, args):
     # Data loading code
     if args.dummy:
         print("=> Dummy data is used!")
-        train_dataset = datasets.FakeData(1281167, (3, 224, 224), 1000, transforms.ToTensor())  # 改成指定数据集的
-        val_dataset = datasets.FakeData(50000, (3, 224, 224), 1000, transforms.ToTensor())  # 改成指定数据集的
+        train_dataset = datasets.FakeData(1281167, (3, 224, 224), 1000, transforms.ToTensor())
+        val_dataset = datasets.FakeData(50000, (3, 224, 224), 1000, transforms.ToTensor())
     else:
         # YOLO格式数据集路径
         train_img_dir = os.path.join(args.data, "images", "train")
         train_label_dir = os.path.join(args.data, "labels", "train")
         val_img_dir = os.path.join(args.data, "images", "val")
         val_label_dir = os.path.join(args.data, "labels", "val")
-        test_img_dir = os.path.join(args.data, "images", "test")
-        test_label_dir = os.path.join(args.data, "labels", "test")
-        class_names_file = os.path.join(args.data, "classes.txt")  # 类别名称文件
+        class_names_file = os.path.join(args.data, "classes.txt")
 
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # 改成指定数据集的
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
         train_dataset = YOLOMultiLabelDataset(
             train_img_dir,
@@ -355,28 +356,12 @@ def main_worker(gpu, ngpus_per_node, args):
             ),
         )
 
-        test_dataset = YOLOMultiLabelDataset(
-            test_img_dir,
-            test_label_dir,
-            class_names_file,
-            transforms.Compose(
-                [
-                    transforms.Resize(256),
-                    transforms.CenterCrop(224),
-                    transforms.ToTensor(),
-                    normalize,
-                ]
-            ),
-        )
-
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False, drop_last=True)
-        test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset, shuffle=False, drop_last=True)
     else:
         train_sampler = None
         val_sampler = None
-        test_sampler = None
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -396,17 +381,8 @@ def main_worker(gpu, ngpus_per_node, args):
         sampler=val_sampler,
     )
 
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.workers,
-        pin_memory=True,
-        sampler=test_sampler,
-    )
-
     if args.evaluate:
-        validate(test_loader, model, criterion, args)
+        validate(val_loader, model, criterion_bce, args)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -414,12 +390,16 @@ def main_worker(gpu, ngpus_per_node, args):
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, device, args)
+        train(train_loader, model, criterion_isda, optimizer, epoch, device, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1 = validate(val_loader, model, criterion_bce, args)
 
         scheduler.step()
+
+        # wandb logging for epoch-level metrics
+        if (args.rank == 0 or not args.distributed) and wandb.run is not None:
+            wandb.log({"epoch/mAP": acc1, "epoch/learning_rate": scheduler.get_last_lr()[0], "epoch/epoch": epoch})
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -436,9 +416,20 @@ def main_worker(gpu, ngpus_per_node, args):
                     "best_acc1": best_acc1,
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
+                    "criterion_isda": criterion_isda,
                 },
                 is_best,
             )
+
+            # Save model artifact to wandb when we have a new best model
+            if is_best and (args.rank == 0 or not args.distributed) and wandb.run is not None:
+                artifact = wandb.Artifact(f"model-{wandb.run.id}", type="model")
+                artifact.add_file("model_best.pth.tar")
+                wandb.log_artifact(artifact)
+
+    # Finish wandb logging
+    if (args.rank == 0 or not args.distributed) and wandb.run is not None:
+        wandb.finish()
 
 
 def train(train_loader, model, criterion, optimizer, epoch, device, args):
@@ -467,9 +458,10 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
 
         # move data to the same device as model
         images = images.to(device, non_blocking=True)
-        target = target.to(device, non_blocking=True)  # compute output
-        output = model(images)
-        loss = criterion(output, target)
+        target = target.to(device, non_blocking=True)
+        # compute output and features
+        output, features = model(images, isda=True)
+        loss = criterion(model, output, features, target, 7.5 * (epoch / args.epochs))
         # measure accuracy and record loss
         acc1, acc2, acc3 = accuracy(output, target)
         losses.update(loss.item(), images.size(0))
@@ -480,6 +472,10 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
+
+        # 计算梯度范数
+        grad_norm = compute_gradient_norm(model)
+
         optimizer.step()
 
         # measure elapsed time
@@ -488,6 +484,24 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
 
         if i % args.print_freq == 0:
             progress.display(i + 1)
+
+            # wandb logging for training metrics
+            if (args.rank == 0 or not args.distributed) and wandb.run is not None:
+                step = epoch * len(train_loader) + i
+                wandb.log(
+                    {
+                        "train/loss": losses.avg,
+                        "train/mAP": mAP.avg,
+                        "train/f1_overall": f1_overall.avg,
+                        "train/f1_classwise": f1_classwise.avg,
+                        "train/batch_time": batch_time.avg,
+                        "train/data_time": data_time.avg,
+                        "train/gradient_norm": grad_norm,
+                        "epoch": epoch,
+                        "learning_rate": optimizer.param_groups[0]["lr"],
+                    },
+                    step=step,
+                )
 
 
 def validate(val_loader, model, criterion, args):
@@ -513,8 +527,8 @@ def validate(val_loader, model, criterion, args):
                     else:
                         images = images.to(device)
                         target = target.to(device)
-                # compute output
-                output = model(images)
+                # compute output and features
+                output, features = model(images, isda=True)
                 loss = criterion(output, target)
 
                 # measure accuracy and record loss
@@ -561,6 +575,18 @@ def validate(val_loader, model, criterion, args):
         run_validate(aux_val_loader, len(val_loader))
 
     progress.display_summary()
+
+    # wandb logging for validation metrics
+    if (args.rank == 0 or not args.distributed) and wandb.run is not None:
+        wandb.log(
+            {
+                "val/loss": losses.avg,
+                "val/mAP": mAP.avg,
+                "val/f1_overall": f1_overall.avg,
+                "val/f1_classwise": f1_classwise.avg,
+                "val/batch_time": batch_time.avg,
+            }
+        )
 
     return mAP.avg
 
