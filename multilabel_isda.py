@@ -259,11 +259,11 @@ def main_worker(gpu, ngpus_per_node, args):
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
             if args.gpu is None:
-                checkpoint = torch.load(args.resume)
+                checkpoint = torch.load(args.resume, weights_only=False)
             else:
                 # Map model to be loaded to specified single gpu.
                 loc = f"{device.type}:{args.gpu}"
-                checkpoint = torch.load(args.resume, map_location=loc)
+                checkpoint = torch.load(args.resume, map_location=loc, weights_only=False)
             args.start_epoch = checkpoint["epoch"]
             best_acc1 = checkpoint["best_acc1"]
             if args.gpu is not None:
@@ -288,6 +288,8 @@ def main_worker(gpu, ngpus_per_node, args):
         train_label_dir = os.path.join(args.data, "labels", "train")
         val_img_dir = os.path.join(args.data, "images", "val")
         val_label_dir = os.path.join(args.data, "labels", "val")
+        test_img_dir = os.path.join(args.data, "images", "test")
+        test_label_dir = os.path.join(args.data, "labels", "test")
         class_names_file = os.path.join(args.data, "classes.txt")
 
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -320,12 +322,28 @@ def main_worker(gpu, ngpus_per_node, args):
             ),
         )
 
+        test_dataset = YOLOMultiLabelDataset(
+            test_img_dir,
+            test_label_dir,
+            class_names_file,
+            transforms.Compose(
+                [
+                    transforms.Resize(256),
+                    transforms.CenterCrop(224),
+                    transforms.ToTensor(),
+                    normalize,
+                ]
+            ),
+        )
+
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False, drop_last=True)
+        test_sampler = torch.utils.data.distributed.DistributedSampler(test_dataset, shuffle=False, drop_last=True)
     else:
         train_sampler = None
         val_sampler = None
+        test_sampler = None
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -345,8 +363,17 @@ def main_worker(gpu, ngpus_per_node, args):
         sampler=val_sampler,
     )
 
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=True,
+        sampler=test_sampler,
+    )
+
     if args.evaluate:
-        validate(val_loader, model, criterion_bce, args)
+        validate(test_loader, model, criterion_bce, args)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
