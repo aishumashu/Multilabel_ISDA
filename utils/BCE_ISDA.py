@@ -44,7 +44,7 @@ class ISDA_BCELoss(nn.Module):
         self.estimator = EstimatorCV(feature_num, class_num)
         self.class_num = class_num
 
-    def isda_aug(self, fc, features, labels, ratio):
+    def isda_aug(self, fc, features, labels, ratio, var_type):
         N = features.size(0)
         C = self.class_num
         A = features.size(1)
@@ -61,10 +61,17 @@ class ISDA_BCELoss(nn.Module):
 
         # 计算每个样本正标签类别的总数量，从Amount中获取
         pos_label_num = labels * Amount  # N, C
-        pos_label_amount = torch.clamp(pos_label_num.sum(dim=1, keepdim=True), min=1)  # 避免除零
+        pos_label_amount = pos_label_num.sum(dim=1, keepdim=True)  # N, C
 
         # 选择正标签类别的协方差并求和
-        selected_cov = pos_label_num.unsqueeze(2) * Cov / pos_label_amount.unsqueeze(2)  # N, C, A
+        if var_type == "weighted-var":
+            pos_label_amount = torch.clamp(pos_label_amount, min=1)  # 避免除零
+            selected_cov = Cov * pos_label_num.unsqueeze(2) / pos_label_amount.unsqueeze(2)  # N, C, A
+        elif var_type == "inverted-weighted-var":
+            pos_label_num = torch.clamp(pos_label_num, min=1)  # 避免除零
+            selected_cov = (
+                Cov * labels.unsqueeze(2) / pos_label_num.unsqueeze(2) * pos_label_amount.unsqueeze(2)
+            )  # N, C, A
         fused_cov = selected_cov.sum(dim=1)  # N, A (对C维度求和)
 
         # 计算sigma2：权重差异平方 * 融合协方差
@@ -72,7 +79,7 @@ class ISDA_BCELoss(nn.Module):
 
         return sigma2
 
-    def forward(self, model, output, features, target, ratio):
+    def forward(self, model, output, features, target, ratio, var_type):
         self.estimator.update_CV(features.detach(), target)
 
         # 处理包装后的模型，提取原始模型
@@ -95,7 +102,7 @@ class ISDA_BCELoss(nn.Module):
         else:
             raise AttributeError("Cannot find fc or classifier layer in the model")
 
-        isda_aug_y = self.isda_aug(fc, features, target, ratio)
+        isda_aug_y = self.isda_aug(fc, features, target, ratio, var_type)
         augmented_output = output + isda_aug_y * (1 - 2 * target)
 
         loss = nn.BCEWithLogitsLoss()(augmented_output, target)

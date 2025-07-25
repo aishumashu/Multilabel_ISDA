@@ -293,11 +293,11 @@ def main_worker(gpu, ngpus_per_node, args):
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
             if args.gpu is None:
-                checkpoint = torch.load(args.resume)
+                checkpoint = torch.load(args.resume, weights_only=False)
             else:
                 # Map model to be loaded to specified single gpu.
                 loc = f"{device.type}:{args.gpu}"
-                checkpoint = torch.load(args.resume, map_location=loc)
+                checkpoint = torch.load(args.resume, map_location=loc, weights_only=False)
             args.start_epoch = checkpoint["epoch"]
             best_acc1 = checkpoint["best_acc1"]
             if args.gpu is not None:
@@ -333,7 +333,8 @@ def main_worker(gpu, ngpus_per_node, args):
             class_names_file,
             transforms.Compose(
                 [
-                    transforms.RandomResizedCrop(224),
+                    transforms.Resize(256),
+                    transforms.CenterCrop(224),
                     transforms.RandomHorizontalFlip(),
                     transforms.ToTensor(),
                     normalize,
@@ -451,9 +452,10 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
     mAP = AverageMeter("mAP", use_accel, ":6.2f", Summary.NONE)
     f1_overall = AverageMeter("F1-Overall", use_accel, ":6.2f", Summary.NONE)
     f1_classwise = AverageMeter("F1-Classwise", use_accel, ":6.2f", Summary.NONE)
+    subset_acc = AverageMeter("Subset-Acc", use_accel, ":6.2f", Summary.NONE)
     progress = ProgressMeter(
         len(train_loader),
-        [batch_time, data_time, losses, mAP, f1_overall, f1_classwise],
+        [batch_time, data_time, losses, mAP, f1_overall, f1_classwise, subset_acc],
         prefix="Epoch: [{}]".format(epoch),
     )
 
@@ -467,15 +469,17 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
 
         # move data to the same device as model
         images = images.to(device, non_blocking=True)
-        target = target.to(device, non_blocking=True)  # compute output
+        target = target.to(device, non_blocking=True)
+        # compute output
         output = model(images)
         loss = criterion(output, target)
         # measure accuracy and record loss
-        acc1, acc2, acc3 = accuracy(output, target)
+        acc1, acc2, acc3, acc4 = accuracy(output, target)
         losses.update(loss.item(), images.size(0))
         mAP.update(acc1[0], images.size(0))
         f1_overall.update(acc2[0], images.size(0))
         f1_classwise.update(acc3[0], images.size(0))
+        subset_acc.update(acc4[0], images.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -515,14 +519,13 @@ def validate(val_loader, model, criterion, args):
                         target = target.to(device)
                 # compute output
                 output = model(images)
-                loss = criterion(output, target)
-
-                # measure accuracy and record loss
-                acc1, acc2, acc3 = accuracy(output, target)
+                loss = criterion(output, target)  # measure accuracy and record loss
+                acc1, acc2, acc3, acc4 = accuracy(output, target)
                 losses.update(loss.item(), images.size(0))
                 mAP.update(acc1[0], images.size(0))
                 f1_overall.update(acc2[0], images.size(0))
                 f1_classwise.update(acc3[0], images.size(0))
+                subset_acc.update(acc4[0], images.size(0))
 
                 # measure elapsed time
                 batch_time.update(time.time() - end)
@@ -536,9 +539,10 @@ def validate(val_loader, model, criterion, args):
     mAP = AverageMeter("mAP", use_accel, ":6.2f", Summary.AVERAGE)
     f1_overall = AverageMeter("F1-Overall", use_accel, ":6.2f", Summary.AVERAGE)
     f1_classwise = AverageMeter("F1-Classwise", use_accel, ":6.2f", Summary.AVERAGE)
+    subset_acc = AverageMeter("Subset-Acc", use_accel, ":6.2f", Summary.AVERAGE)
     progress = ProgressMeter(
         len(val_loader) + (args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset))),
-        [batch_time, losses, mAP, f1_overall, f1_classwise],
+        [batch_time, losses, mAP, f1_overall, f1_classwise, subset_acc],
         prefix="Test: ",
     )
 
@@ -550,6 +554,7 @@ def validate(val_loader, model, criterion, args):
         mAP.all_reduce()
         f1_overall.all_reduce()
         f1_classwise.all_reduce()
+        subset_acc.all_reduce()
 
     if args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset)):
         aux_val_dataset = Subset(
@@ -690,8 +695,12 @@ def accuracy(output, target):
             2 * precision_classwise * recall_classwise / (precision_classwise + recall_classwise + 1e-8)
         ).mean() * 100.0
 
-        # 返回三个值：mAP, Overall F1, Class-wise F1
-        return [mAP], [f1_overall], [f1_classwise]
+        # 计算subset acc
+        exact_match = (predictions == target.bool()).all(dim=1).float()
+        exact_match_acc = exact_match.mean() * 100.0
+
+        # 返回四个值：mAP, Overall F1, Class-wise F1, Subset Accuracy
+        return [mAP], [f1_overall], [f1_classwise], [exact_match_acc]
 
 
 if __name__ == "__main__":

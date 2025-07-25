@@ -91,6 +91,19 @@ parser.add_argument(
     "multi node data parallel training",
 )
 parser.add_argument("--dummy", action="store_true", help="use fake data to benchmark")
+parser.add_argument(
+    "--lambda_0",
+    default=7.5,
+    type=float,
+    help="The hyper-parameter \lambda_0 for ISDA, select from {1, 2.5, 5, 7.5, 10}. "
+    "We adopt 1 for DenseNets and 7.5 for ResNets and ResNeXts, except for using 5 for ResNet-101.",
+)
+parser.add_argument(
+    "--var-type",
+    default="weighted-var",
+    type=str,
+    help="The type of variance, select from {weighted-var, inverted-weighted-var}.",
+)
 parser.add_argument("--project-name", default="multilabel-isda", type=str, help="wandb project name")
 parser.add_argument("--run-name", default=None, type=str, help="wandb run name")
 parser.add_argument("--wandb-offline", action="store_true", help="run wandb in offline mode")
@@ -295,11 +308,11 @@ def main_worker(gpu, ngpus_per_node, args):
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
             if args.gpu is None:
-                checkpoint = torch.load(args.resume)
+                checkpoint = torch.load(args.resume, weights_only=False)
             else:
                 # Map model to be loaded to specified single gpu.
                 loc = f"{device.type}:{args.gpu}"
-                checkpoint = torch.load(args.resume, map_location=loc)
+                checkpoint = torch.load(args.resume, map_location=loc, weights_only=False)
             args.start_epoch = checkpoint["epoch"]
             best_acc1 = checkpoint["best_acc1"]
             if args.gpu is not None:
@@ -334,7 +347,8 @@ def main_worker(gpu, ngpus_per_node, args):
             class_names_file,
             transforms.Compose(
                 [
-                    transforms.RandomResizedCrop(224),
+                    transforms.Resize(256),
+                    transforms.CenterCrop(224),
                     transforms.RandomHorizontalFlip(),
                     transforms.ToTensor(),
                     normalize,
@@ -442,9 +456,10 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
     mAP = AverageMeter("mAP", use_accel, ":6.2f", Summary.NONE)
     f1_overall = AverageMeter("F1-Overall", use_accel, ":6.2f", Summary.NONE)
     f1_classwise = AverageMeter("F1-Classwise", use_accel, ":6.2f", Summary.NONE)
+    subset_acc = AverageMeter("Subset-Acc", use_accel, ":6.2f", Summary.NONE)
     progress = ProgressMeter(
         len(train_loader),
-        [batch_time, data_time, losses, mAP, f1_overall, f1_classwise],
+        [batch_time, data_time, losses, mAP, f1_overall, f1_classwise, subset_acc],
         prefix="Epoch: [{}]".format(epoch),
     )
 
@@ -461,13 +476,14 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         target = target.to(device, non_blocking=True)
         # compute output and features
         output, features = model(images, isda=True)
-        loss = criterion(model, output, features, target, 7.5 * (epoch / args.epochs))
+        loss = criterion(model, output, features, target, args.lambda_0 * (epoch / args.epochs), args.var_type)
         # measure accuracy and record loss
-        acc1, acc2, acc3 = accuracy(output, target)
+        acc1, acc2, acc3, acc4 = accuracy(output, target)
         losses.update(loss.item(), images.size(0))
         mAP.update(acc1[0], images.size(0))
         f1_overall.update(acc2[0], images.size(0))
         f1_classwise.update(acc3[0], images.size(0))
+        subset_acc.update(acc4[0], images.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -494,6 +510,7 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
                         "train/mAP": mAP.avg,
                         "train/f1_overall": f1_overall.avg,
                         "train/f1_classwise": f1_classwise.avg,
+                        "train/subset_acc": subset_acc.avg,
                         "train/batch_time": batch_time.avg,
                         "train/data_time": data_time.avg,
                         "train/gradient_norm": grad_norm,
@@ -507,6 +524,18 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
 def validate(val_loader, model, criterion, args):
 
     use_accel = not args.no_accel and torch.accelerator.is_available()
+
+    batch_time = AverageMeter("Time", use_accel, ":6.3f", Summary.NONE)
+    losses = AverageMeter("Loss", use_accel, ":.4e", Summary.NONE)
+    mAP = AverageMeter("mAP", use_accel, ":6.2f", Summary.AVERAGE)
+    f1_overall = AverageMeter("F1-Overall", use_accel, ":6.2f", Summary.AVERAGE)
+    f1_classwise = AverageMeter("F1-Classwise", use_accel, ":6.2f", Summary.AVERAGE)
+    subset_acc = AverageMeter("Subset-Acc", use_accel, ":6.2f", Summary.AVERAGE)
+    progress = ProgressMeter(
+        len(val_loader) + (args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset))),
+        [batch_time, losses, mAP, f1_overall, f1_classwise, subset_acc],
+        prefix="Test: ",
+    )
 
     def run_validate(loader, base_progress=0):
 
@@ -532,11 +561,12 @@ def validate(val_loader, model, criterion, args):
                 loss = criterion(output, target)
 
                 # measure accuracy and record loss
-                acc1, acc2, acc3 = accuracy(output, target)
+                acc1, acc2, acc3, acc4 = accuracy(output, target)
                 losses.update(loss.item(), images.size(0))
                 mAP.update(acc1[0], images.size(0))
                 f1_overall.update(acc2[0], images.size(0))
                 f1_classwise.update(acc3[0], images.size(0))
+                subset_acc.update(acc4[0], images.size(0))
 
                 # measure elapsed time
                 batch_time.update(time.time() - end)
@@ -544,17 +574,6 @@ def validate(val_loader, model, criterion, args):
 
                 if i % args.print_freq == 0:
                     progress.display(i + 1)
-
-    batch_time = AverageMeter("Time", use_accel, ":6.3f", Summary.NONE)
-    losses = AverageMeter("Loss", use_accel, ":.4e", Summary.NONE)
-    mAP = AverageMeter("mAP", use_accel, ":6.2f", Summary.AVERAGE)
-    f1_overall = AverageMeter("F1-Overall", use_accel, ":6.2f", Summary.AVERAGE)
-    f1_classwise = AverageMeter("F1-Classwise", use_accel, ":6.2f", Summary.AVERAGE)
-    progress = ProgressMeter(
-        len(val_loader) + (args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset))),
-        [batch_time, losses, mAP, f1_overall, f1_classwise],
-        prefix="Test: ",
-    )
 
     # switch to evaluate mode
     model.eval()
@@ -564,6 +583,7 @@ def validate(val_loader, model, criterion, args):
         mAP.all_reduce()
         f1_overall.all_reduce()
         f1_classwise.all_reduce()
+        subset_acc.all_reduce()
 
     if args.distributed and (len(val_loader.sampler) * args.world_size < len(val_loader.dataset)):
         aux_val_dataset = Subset(
@@ -584,6 +604,7 @@ def validate(val_loader, model, criterion, args):
                 "val/mAP": mAP.avg,
                 "val/f1_overall": f1_overall.avg,
                 "val/f1_classwise": f1_classwise.avg,
+                "val/subset_acc": subset_acc.avg,
                 "val/batch_time": batch_time.avg,
             }
         )
@@ -716,8 +737,12 @@ def accuracy(output, target):
             2 * precision_classwise * recall_classwise / (precision_classwise + recall_classwise + 1e-8)
         ).mean() * 100.0
 
-        # 返回三个值：mAP, Overall F1, Class-wise F1
-        return [mAP], [f1_overall], [f1_classwise]
+        # 计算subset acc
+        exact_match = (predictions == target.bool()).all(dim=1).float()
+        exact_match_acc = exact_match.mean() * 100.0
+
+        # 返回四个值：mAP, Overall F1, Class-wise F1, Subset Accuracy
+        return [mAP], [f1_overall], [f1_classwise], [exact_match_acc]
 
 
 if __name__ == "__main__":
