@@ -19,7 +19,7 @@ import torch.utils.data.distributed
 import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as transforms
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import Subset, Dataset
 from PIL import Image
 from torchmetrics.classification import MultilabelAveragePrecision
@@ -285,31 +285,6 @@ def main_worker(gpu, ngpus_per_node, args):
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
-    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
-
-    # optionally resume from a checkpoint
-    if args.resume:
-        if os.path.isfile(args.resume):
-            print("=> loading checkpoint '{}'".format(args.resume))
-            if args.gpu is None:
-                checkpoint = torch.load(args.resume, weights_only=False)
-            else:
-                # Map model to be loaded to specified single gpu.
-                loc = f"{device.type}:{args.gpu}"
-                checkpoint = torch.load(args.resume, map_location=loc, weights_only=False)
-            args.start_epoch = checkpoint["epoch"]
-            best_acc1 = checkpoint["best_acc1"]
-            if args.gpu is not None:
-                # best_acc1 may be from a checkpoint from a different GPU
-                best_acc1 = best_acc1.to(args.gpu)
-            model.load_state_dict(checkpoint["state_dict"])
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            scheduler.load_state_dict(checkpoint["scheduler"])
-            print("=> loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint["epoch"]))
-        else:
-            print("=> no checkpoint found at '{}'".format(args.resume))
-
     # Data loading code
     if args.dummy:
         print("=> Dummy data is used!")
@@ -406,6 +381,32 @@ def main_worker(gpu, ngpus_per_node, args):
         sampler=test_sampler,
     )
 
+    # OneCycleLR scheduler for better convergence
+    total_steps = len(train_loader) * args.epochs
+    scheduler = OneCycleLR(optimizer, max_lr=args.lr, total_steps=total_steps)
+
+    # optionally resume from a checkpoint
+    if args.resume:
+        if os.path.isfile(args.resume):
+            print("=> loading checkpoint '{}'".format(args.resume))
+            if args.gpu is None:
+                checkpoint = torch.load(args.resume, weights_only=False)
+            else:
+                # Map model to be loaded to specified single gpu.
+                loc = f"{device.type}:{args.gpu}"
+                checkpoint = torch.load(args.resume, map_location=loc, weights_only=False)
+            args.start_epoch = checkpoint["epoch"]
+            best_acc1 = checkpoint["best_acc1"]
+            if args.gpu is not None:
+                # best_acc1 may be from a checkpoint from a different GPU
+                best_acc1 = best_acc1.to(args.gpu)
+            model.load_state_dict(checkpoint["state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            scheduler.load_state_dict(checkpoint["scheduler"])
+            print("=> loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint["epoch"]))
+        else:
+            print("=> no checkpoint found at '{}'".format(args.resume))
+
     if args.evaluate:
         validate(test_loader, model, criterion, args)
         return
@@ -415,12 +416,10 @@ def main_worker(gpu, ngpus_per_node, args):
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, device, args)
+        train(train_loader, model, criterion, optimizer, scheduler, epoch, device, args)
 
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, args)
-
-        scheduler.step()
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -442,7 +441,7 @@ def main_worker(gpu, ngpus_per_node, args):
             )
 
 
-def train(train_loader, model, criterion, optimizer, epoch, device, args):
+def train(train_loader, model, criterion, optimizer, scheduler, epoch, device, args):
 
     use_accel = not args.no_accel and torch.accelerator.is_available()
 
@@ -485,6 +484,9 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+        # OneCycleLR step after each batch
+        scheduler.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
